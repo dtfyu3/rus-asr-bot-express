@@ -118,7 +118,7 @@ async function sendTelegramMessage(chatId, text, keyboard = null, reply = false,
         chat_id: chatId,
         text: text.substring(0, 4096),
         parse_mode: 'Markdown',
-        reply_parameters: (reply && messageId) ? { message_id: messageId } : null
+        reply_parameters: (reply && messageId) ? { message_id: messageId } : {}
     };
     if (keyboard) {
         payload.reply_markup = keyboard;
