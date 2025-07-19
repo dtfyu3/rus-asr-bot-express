@@ -9,8 +9,6 @@ RUN apt-get update && \
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
-COPY resolv.conf /etc/resolv.conf
-
 COPY package*.json ./
 
 RUN chown node:node package*.json || true
