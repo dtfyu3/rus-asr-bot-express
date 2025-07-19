@@ -112,12 +112,13 @@ async function sendTelegramChatAction(chatId, action) {
 }
 
 
-async function sendTelegramMessage(chatId, text, keyboard = null) {
+async function sendTelegramMessage(chatId, text, keyboard = null, reply = false, messageId = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
     const payload = {
         chat_id: chatId,
         text: text.substring(0, 4096),
         parse_mode: 'Markdown',
+        reply_parameters: (reply && messageId) ? { message_id: messageId } : null
     };
     if (keyboard) {
         payload.reply_markup = keyboard;
@@ -397,7 +398,6 @@ async function cleanupTempFiles() {
 
 
 
-
 app.get('/health', async (req, res) => {
     return res.status(200).send('Server is alive');
 })
@@ -443,6 +443,7 @@ app.post(webhookPath, async (req, res) => {
     res.sendStatus(200);
 
     try {
+        let processingWarningMessageId;
         if (update.callback_query) {
             const cbq = update.callback_query;
             const chatId = cbq.message.chat.id;
@@ -451,7 +452,7 @@ app.post(webhookPath, async (req, res) => {
 
             if (chatId === audioProcessingId && isProcessing) {
                 if (processingWarningMessageCount === 0) {
-                    sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
+                    processingWarningMessageId = await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
                     processingWarningMessageCount++;
                 }
                 return;
@@ -465,9 +466,10 @@ app.post(webhookPath, async (req, res) => {
         } else if (update.message) {
             const message = update.message;
             const chatId = message.chat.id;
+            const messageId = message.message_id;
             if (chatId === audioProcessingId && isProcessing) {
                 if (processingWarningMessageCount === 0) {
-                    sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
+                    processingWarningMessageId = await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
                     processingWarningMessageCount++;
                 }
                 return;
@@ -496,7 +498,11 @@ app.post(webhookPath, async (req, res) => {
             } else if (message.voice || message.audio || (message.document && message.document.mime_type.startsWith('audio/'))) {
                 const fileInfo = message.voice || message.audio || message.document;
 
-                await sendTelegramChatAction(chatId, 'typing');
+                const typingIntervalId = setInterval(() => {
+                    sendTelegramChatAction(chatId, 'typing');
+
+                }, 4000);
+                // await sendTelegramChatAction(chatId, 'typing');
                 const progressMessage = await sendTelegramMessage(chatId, "🎧 Обрабатываю аудио...");
                 const messageToEditId = progressMessage && progressMessage.ok ? progressMessage.result.message_id : null;
 
@@ -506,6 +512,7 @@ app.post(webhookPath, async (req, res) => {
                     isProcessing = false;
                     audioProcessingId = null;
                     processingWarningMessageCount = 0;
+                    clearInterval(typingIntervalId);
                     return res;
                 });
 
@@ -521,7 +528,9 @@ app.post(webhookPath, async (req, res) => {
                     //     await sendTelegramMessage(chatId, responseText);
                     // }
                     await deleteTelegramMessage(chatId, messageToEditId);
-                    await sendTelegramMessage(chatId, responseText);
+                    processingWarningMessageId && deleteTelegramMessage(chatId, processingWarningMessageId);
+
+                    await sendTelegramMessage(chatId, responseText, null, true, messageId);
                 } else {
                     const errorText = `Ошибка: ${result.error || 'Не удалось обработать аудио.'}`;
                     if (messageToEditId) {
