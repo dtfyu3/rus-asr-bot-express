@@ -443,19 +443,19 @@ app.post(webhookPath, async (req, res) => {
     res.sendStatus(200);
 
     try {
-        if (chatId === audioProcessingId && isProcessing) {
-            if (processingWarningMessageCount === 0) {
-                sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
-                processingWarningMessageCount++;
-            }
-            return;
-        }
         if (update.callback_query) {
             const cbq = update.callback_query;
             const chatId = cbq.message.chat.id;
             const messageId = cbq.message.message_id;
             const data = cbq.data;
 
+            if (chatId === audioProcessingId && isProcessing) {
+                if (processingWarningMessageCount === 0) {
+                    sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
+                    processingWarningMessageCount++;
+                }
+                return;
+            }
             if (data.startsWith('select_model:')) {
                 const model = data.substring('select_model:'.length);
                 await setUserModel(chatId, model);
@@ -463,6 +463,13 @@ app.post(webhookPath, async (req, res) => {
                 await editTelegramMessageText(chatId, messageId, `Вы выбрали модель: *${model}*.`, true);
             }
         } else if (update.message) {
+            if (chatId === audioProcessingId && isProcessing) {
+                if (processingWarningMessageCount === 0) {
+                    sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
+                    processingWarningMessageCount++;
+                }
+                return;
+            }
             const message = update.message;
             const chatId = message.chat.id;
 
