@@ -376,12 +376,13 @@ async function cleanupTempFiles() {
         const files = await fs.readdir(TEMP_DIR);
         const now = Date.now();
         const oneHour = 60 * 60 * 1000;
-
+        const fiveMinutes = 5 * 60 * 1000;
+        
         for (const file of files) {
             const filePath = path.join(TEMP_DIR, file);
             try {
                 const stats = await fs.stat(filePath);
-                if (now - stats.mtimeMs > oneHour) {
+                if (now - stats.mtimeMs > fiveMinutes) {
                     await fs.unlink(filePath);
                     console.log(`Deleted old temp file: ${filePath}`);
                 }
