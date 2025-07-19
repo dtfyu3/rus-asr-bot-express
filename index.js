@@ -463,6 +463,8 @@ app.post(webhookPath, async (req, res) => {
                 await editTelegramMessageText(chatId, messageId, `Вы выбрали модель: *${model}*.`, true);
             }
         } else if (update.message) {
+            const message = update.message;
+            const chatId = message.chat.id;
             if (chatId === audioProcessingId && isProcessing) {
                 if (processingWarningMessageCount === 0) {
                     sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
@@ -470,9 +472,6 @@ app.post(webhookPath, async (req, res) => {
                 }
                 return;
             }
-            const message = update.message;
-            const chatId = message.chat.id;
-
             if (message.text) {
                 if (message.text === '/change_model') {
                     let text = "Выберите из нижеприведенных моделей:\n\n";
@@ -502,8 +501,8 @@ app.post(webhookPath, async (req, res) => {
                 const messageToEditId = progressMessage && progressMessage.ok ? progressMessage.result.message_id : null;
 
 
-                
-                const result = await processAudio(fileInfo, chatId, messageToEditId).then(res=>{
+
+                const result = await processAudio(fileInfo, chatId, messageToEditId).then(res => {
                     isProcessing = false;
                     audioProcessingId = null;
                     processingWarningMessageCount = 0;
