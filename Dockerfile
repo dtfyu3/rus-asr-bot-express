@@ -9,6 +9,8 @@ RUN apt-get update && \
 # Set the working directory in the container
 WORKDIR /usr/src/app
 
+RUN npm install -g pm2
+
 COPY package*.json ./
 
 RUN chown node:node package*.json || true
@@ -28,4 +30,4 @@ COPY . .
 EXPOSE 7860
 
 # Define the command to run your app
-CMD [ "node", "index.js" ]
+CMD ["pm2-runtime", "index.js", "-i", "max"]
