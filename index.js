@@ -22,6 +22,7 @@ app.use(async (req, res, next) => {
             console.log('✅ Telegram resolved to:', addresses);
         }
     });
+    if(req.method === 'HEAD' || req.originalUrl === '/health') next();
     const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
     const message = req.body?.message;
     let cmd = message?.text || req.body?.callback_query?.data || req.query?.text || '';
@@ -44,7 +45,7 @@ app.use(async (req, res, next) => {
     data['url'] = req.originalUrl;
     console.log(log);
     try {
-        await fetch(process.env.GOOGLE_SCRIPT_URL, {
+        fetch(process.env.GOOGLE_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ data: data }),
