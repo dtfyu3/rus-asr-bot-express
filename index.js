@@ -43,7 +43,7 @@ app.use(async (req, res, next) => {
     data['url'] = req.originalUrl;
     console.log(log);
     try {
-        fetch(process.env.GOOGLE_SCRIPT_URL, {
+        await fetch(process.env.GOOGLE_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ data: data }),
