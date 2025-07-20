@@ -34,6 +34,7 @@ app.use(async (req, res, next) => {
         cmd = `text: '${cmd}'`;
     }
     const log = `[${moscowTime}] ${req.method} user ${JSON.stringify(user)} chatId ${chatId} ${cmd} ${req.originalUrl}`;
+    console.log('req.body:', req.body);
     const data = {};
     data['time'] = moscowTime;
     data['request'] = req.method;
