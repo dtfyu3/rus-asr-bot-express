@@ -44,7 +44,7 @@ app.use(async (req, res, next) => {
     data['url'] = req.originalUrl;
     console.log(log);
     try {
-        fetch(process.env.GOOGLE_SCRIPT_URL, {
+        await fetch(process.env.GOOGLE_SCRIPT_URL, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ data: data }),
@@ -378,12 +378,12 @@ async function cleanupTempFiles() {
         const now = Date.now();
         const oneHour = 60 * 60 * 1000;
         const fiveMinutes = 5 * 60 * 1000;
-        
+
         for (const file of files) {
             const filePath = path.join(TEMP_DIR, file);
             try {
                 const stats = await fs.stat(filePath);
-                if (now - stats.mtimeMs > fiveMinutes) {
+                if (now - stats.mtimeMs > fiveMinutes) {////////////
                     await fs.unlink(filePath);
                     console.log(`Deleted old temp file: ${filePath}`);
                 }
@@ -493,7 +493,13 @@ app.post(webhookPath, async (req, res) => {
                     const modelDescription = MODELS_INFO[currentModel] || "Неизвестная модель";
                     const text = `Ваша текущая модель:\n*${currentModel}* - ${modelDescription}`;
                     await sendTelegramMessage(chatId, text);
-                } else {
+                } 
+                
+                else {//for admin
+                    if (message.text = '/endpoints' && chatId == process.env.CHAT_ID){
+                        const text = `vosk: ${VOSK_ENDPOINT}\n whisper: ${WHISPER_ENDPOINT}`;
+                        await sendTelegramMessage(chatId, text);
+                    }
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                     await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
                 }
@@ -530,7 +536,7 @@ app.post(webhookPath, async (req, res) => {
                     //     await sendTelegramMessage(chatId, responseText);
                     // }
                     await deleteTelegramMessage(chatId, messageToEditId);
-                    processingWarningMessageId && deleteTelegramMessage(chatId, processingWarningMessageId);
+                    processingWarningMessageId && await deleteTelegramMessage(chatId, processingWarningMessageId);
 
                     await sendTelegramMessage(chatId, responseText, null, true, messageId);
                 } else {
