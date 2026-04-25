@@ -499,6 +499,7 @@ app.post(webhookPath, async (req, res) => {
                     if (message.text === '/endpoints' && chatId == process.env.CHAT_ID){
                         const text = `vosk: ${VOSK_ENDPOINT}\n whisper: ${WHISPER_ENDPOINT}`;
                         await sendTelegramMessage(chatId, text);
+                        break;
                     }
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                     await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
