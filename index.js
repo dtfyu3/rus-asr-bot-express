@@ -496,7 +496,7 @@ app.post(webhookPath, async (req, res) => {
                 } 
                 
                 else {//for admin
-                    if (message.text === '/endpoints' && chatId === process.env.CHAT_ID){
+                    if (message.text === '/endpoints' && chatId == process.env.CHAT_ID){
                         const text = `vosk: ${VOSK_ENDPOINT}\n whisper: ${WHISPER_ENDPOINT}`;
                         await sendTelegramMessage(chatId, text);
                     }
