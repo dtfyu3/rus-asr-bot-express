@@ -2,92 +2,53 @@ const express = require('express');
 const dotenv = require('dotenv');
 const path = require('path');
 const fs = require('fs/promises');
-const fsSync = require('fs'); // For synchronous checks if needed
-//const fetch = require('node-fetch');
+const fsSync = require('fs');
 const ffmpeg = require('fluent-ffmpeg');
+const ffmpegInstaller = require('@ffmpeg-installer/ffmpeg');
 const FormData = require('form-data');
-const crypto = require('crypto'); // For unique file names
-const { request } = require('http');
+const crypto = require('crypto');
+const fetch = require('node-fetch');
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
-app.use(async (req, res, next) => {
-    require('dns').resolve('api.telegram.org', (err, addresses) => {
-        if (err) {
-            console.error('❌ DNS RESOLVE ERROR:', err);
-            return;
-        } else {
-            console.log('✅ Telegram resolved to:', addresses);
-        }
-    });
-    if(req.method === 'HEAD' || req.originalUrl === '/health') next();
-    const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
-    const message = req.body?.message;
-    let cmd = message?.text || req.body?.callback_query?.data || req.query?.text || '';
-    const user = message?.from || req.body?.callback_query?.from;
-    const chatId = message?.chat?.id || req.body?.callback_query?.message?.chat?.id;
-    if (!cmd) {
-        cmd = (message?.voice || message?.audio || (message?.document && message?.document.mime_type.startsWith('audio/'))) ? 'audio' : '';
-    }
-    else {
-        cmd = `text: '${cmd}'`;
-    }
-    const log = `[${moscowTime}] ${req.method} user ${JSON.stringify(user)} chatId ${chatId} ${cmd} ${req.originalUrl}`;
-    const data = {};
-    data['time'] = moscowTime;
-    data['request'] = req.method;
-    data['user'] = JSON.stringify(user);
-    data['chatId'] = chatId;
-    data['cmd'] = cmd;
-    data['url'] = req.originalUrl;
-    console.log(log);
-    try {
-        await fetch(process.env.GOOGLE_SCRIPT_URL, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ data: data }),
-            family: 4,
-        });
-    } catch (error) {
-        console.error(`Error sending log:`, error);
-    }
-    next();
-});
-let fetch;
-let audioProcessingId;
-let isProcessing = false;
-let processingWarningMessageCount = 0;
+
+const chatStates = new Map();  
+const processedMediaGroups = new Map(); 
+let lastProcessedUpdateId = null;
 
 // --- Configuration ---
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const VOSK_ENDPOINT = process.env.VOSK_ENDPOINT;
 const WHISPER_ENDPOINT = process.env.WHISPER_ENDPOINT;
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
-const PORT = process.env.PORT || 7860;
+const PORT = process.env.PORT || process.env.SERVER_PORT || 7860;
 const WEBHOOK_URL = process.env.WEBHOOK;
-
+const ADMIN_CHAT_ID = process.env.CHAT_ID; // admin ID for logs
 
 const TEMP_DIR = path.join(__dirname, 'tmp_audio');
 const MAX_FILE_SIZE = 16 * 1024 * 1024; // 16 MB
 const UPDATE_LOG_FILE = path.join(__dirname, 'last_update_id.txt');
 const USER_MODELS_FILE = path.join(__dirname, 'user_models.json');
 
+process.env.TMPDIR = TEMP_DIR;
+process.env.TEMP = TEMP_DIR;
+process.env.TMP = TEMP_DIR;
+
 const MODELS_INFO = {
     'Vosk': '🚀 Быстрая, но менее точная',
     'Whisper': '🎯 Больше точность, но меньше скорость'
 };
 
-function requestOptionsBuilder(method, headers, body, family = 4) {
+function requestOptionsBuilder(method, headers, body) {
     return {
         method: method,
         headers: headers,
-        body: body,
-        family: family,
-    }
-
+        body: body
+    };
 }
+
 async function ensureDir(dirPath) {
     try {
         await fs.access(dirPath);
@@ -101,6 +62,62 @@ async function ensureDir(dirPath) {
     }
 }
 
+//logging
+async function sendAdminLog(logText) {
+    if (!ADMIN_CHAT_ID) return;
+    try {
+        await sendTelegramMessage(ADMIN_CHAT_ID, `📝 *Системный лог:*\n\`\`\`\n${logText}\n\`\`\``);
+    } catch (error) {
+        console.error('Ошибка отправки лога администратору:', error);
+    }
+}
+
+// Middleware
+app.use((req, res, next) => {
+    require('dns').resolve('api.telegram.org', (err, addresses) => {
+        if (err) {
+            console.error('❌ DNS RESOLVE ERROR:', err);
+        } else {
+            console.log('✅ Telegram resolved to:', addresses);
+        }
+    });
+
+    if (req.method === 'HEAD' || req.originalUrl === '/health') {
+        return next();
+    }
+
+    const moscowTime = new Date().toLocaleString('ru-RU', { timeZone: 'Europe/Moscow' });
+    const message = req.body?.message;
+    let cmd = message?.text || req.body?.callback_query?.data || req.query?.text || '';
+    const user = message?.from || req.body?.callback_query?.from;
+    const chatId = message?.chat?.id || req.body?.callback_query?.message?.chat?.id;
+
+    if (!cmd) {
+        cmd = (message?.voice || message?.audio || (message?.document && message?.document.mime_type.startsWith('audio/'))) ? 'audio' : '';
+    } else {
+        cmd = `text: '${cmd}'`;
+    }
+
+    const log = `[${moscowTime}] ${req.method} user ${JSON.stringify(user)} chatId ${chatId} ${cmd} ${req.originalUrl}`;
+    console.log(log);
+
+    if (process.env.GOOGLE_SCRIPT_URL) {
+        const data = {
+            time: moscowTime,
+            request: req.method,
+            user: JSON.stringify(user),
+            chatId: chatId,
+            cmd: cmd,
+            url: req.originalUrl
+        };
+    }
+
+    if (chatId && String(chatId) !== String(ADMIN_CHAT_ID)) {
+        sendAdminLog(log).catch(err => console.error('Error in sendAdminLog:', err));
+    }
+
+    next();
+});
 
 async function sendTelegramChatAction(chatId, action) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendChatAction`;
@@ -111,7 +128,6 @@ async function sendTelegramChatAction(chatId, action) {
         console.error(`Error sending chat action ${action} to ${chatId}:`, error);
     }
 }
-
 
 async function sendTelegramMessage(chatId, text, keyboard = null, reply = false, messageId = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
@@ -166,16 +182,16 @@ async function deleteTelegramMessage(chatId, messageId) {
             chat_id: chatId,
             message_id: messageId,
         };
-        const options = requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(payload))
+        const options = requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(payload));
         const response = await fetch(url, options);
         if (!response.ok) {
-            console.error(`Telegram API error (editMessageText ${response.status}):`, await response.text());
+            console.error(`Telegram API error (deleteMessage ${response.status}):`, await response.text());
         }
-    }
-    catch (error) {
+    } catch (error) {
         console.error(`Error deleting message ${messageId} in chat ${chatId}:`, error);
     }
 }
+
 async function answerTelegramCallbackQuery(callbackQueryId, text) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/answerCallbackQuery`;
     const payload = {
@@ -194,11 +210,10 @@ async function answerTelegramCallbackQuery(callbackQueryId, text) {
     }
 }
 
-
 async function downloadTelegramFile(fileId) {
     try {
         const getFileUrl = `https://api.telegram.org/bot${BOT_TOKEN}/getFile?file_id=${fileId}`;
-        const fileInfoResponse = await fetch(getFileUrl, { family: 4 });
+        const fileInfoResponse = await fetch(getFileUrl);
         if (!fileInfoResponse.ok) {
             const error = await fileInfoResponse.text();
             console.error('Failed to get file info from Telegram:', error);
@@ -215,22 +230,23 @@ async function downloadTelegramFile(fileId) {
         const fileSize = fileInfo.result.file_size;
 
         if (fileSize > MAX_FILE_SIZE) {
-            const error = `Размер файла превышает максимальный размер ${MAX_FILE_SIZE / (1024 * 1024)}Мб. `;
+            const error = `Размер файла превышает максимальный размер ${MAX_FILE_SIZE / (1024 * 1024)}Мб.`;
             console.warn(`File ${fileId} exceeds max size: ${fileSize} > ${MAX_FILE_SIZE}`);
             return { status: false, error: error };
         }
 
         const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePathOnTelegram}`;
-        const fileResponse = await fetch(downloadUrl, { family: 4 });
+        const fileResponse = await fetch(downloadUrl);
         if (!fileResponse.ok) {
             const error = await fileResponse.text();
-            console.error('Failed to download file from Telegram:', await fileResponse.text());
+            console.error('Failed to download file from Telegram:', error);
             return { status: false, error: error };
         }
 
         const uniquePrefix = crypto.randomBytes(8).toString('hex');
         const localPath = path.join(TEMP_DIR, `${uniquePrefix}_${path.basename(filePathOnTelegram)}`);
 
+        // ИЗМЕНЕНО: Возвращаем надежный Node.js .pipe() для node-fetch
         const fileStream = fsSync.createWriteStream(localPath);
         await new Promise((resolve, reject) => {
             fileResponse.body.pipe(fileStream);
@@ -241,7 +257,7 @@ async function downloadTelegramFile(fileId) {
         return { status: true, path: localPath };
     } catch (error) {
         console.error('Error downloading Telegram file:', error);
-        return { status: false, error: error };;
+        return { status: false, error: error };
     }
 }
 
@@ -263,7 +279,6 @@ function convertToWav(inputPath) {
             .save(outputPath);
     });
 }
-
 
 async function sendToAsr(audioPath, userId) {
     try {
@@ -296,27 +311,25 @@ async function sendToAsr(audioPath, userId) {
     }
 }
 
-
 async function processAudio(fileInfo, chatId, messageToEditId = null) {
     const fileId = fileInfo.file_id;
     let localFilePath = null;
     let wavPath = null;
     let downloadTelegramFileStatus = null;
-    audioProcessingId = chatId;
-    isProcessing = true;
     try {
         downloadTelegramFileStatus = await downloadTelegramFile(fileId);
         if (!downloadTelegramFileStatus.status) {
-            return { success: false, error: 'Не удалось загрузить файл' };
+            return { success: false, error: 'Не удалось загрузить файл из Telegram' };
         }
         localFilePath = downloadTelegramFileStatus.path;
         await sendTelegramChatAction(chatId, 'typing');
-        if (messageToEditId) await editTelegramMessageText(chatId, messageToEditId, "🔍 Распознаю речь...");
-        else await sendTelegramMessage(chatId, "🔍 Распознаю речь...");
+        if (messageToEditId) {
+            await editTelegramMessageText(chatId, messageToEditId, "🔍 Распознаю речь...");
+        }
 
         wavPath = await convertToWav(localFilePath);
         if (!wavPath) {
-            return { success: false, error: 'Ошибка конвертации в WAV' };
+            return { success: false, error: 'Ошибка конвертации аудио в формат WAV' };
         }
 
         const transcribedText = await sendToAsr(wavPath, chatId);
@@ -331,6 +344,73 @@ async function processAudio(fileInfo, chatId, messageToEditId = null) {
     }
 }
 
+async function handleIncomingAudio(chatId, fileInfo, messageId) {
+    if (!chatStates.has(chatId)) {
+        chatStates.set(chatId, { isProcessing: false, pendingAudio: null });
+    }
+    const state = chatStates.get(chatId);
+
+    if (state.isProcessing) {
+        // Если бот занят, сохраняем присланное аудио (перезаписывая предыдущее ожидающее)
+        const hadPreviousPending = state.pendingAudio !== null;
+        state.pendingAudio = { fileInfo, messageId };
+        console.log(`[Очередь] Чат ${chatId} занят. Новое аудио добавлено в очередь (предыдущие ожидающие перезаписаны).`);
+        
+        // Отправляем предупреждение только один раз, чтобы не спамить в чат
+        if (!hadPreviousPending) {
+            await sendTelegramMessage(chatId, "⏳ *Бот сейчас обрабатывает ваше предыдущее аудио.* Новое сообщение добавлено в очередь и будет обработано сразу после текущего.");
+        }
+        return;
+    }
+
+    await executeAudioProcessing(chatId, fileInfo, messageId);
+}
+
+async function executeAudioProcessing(chatId, fileInfo, messageId) {
+    const state = chatStates.get(chatId);
+    state.isProcessing = true;
+
+    const typingIntervalId = setInterval(() => {
+        sendTelegramChatAction(chatId, 'typing');
+    }, 4000);
+
+    const progressMessage = await sendTelegramMessage(chatId, "🎧 Обрабатываю аудио...");
+    const messageToEditId = progressMessage && progressMessage.ok ? progressMessage.result.message_id : null;
+
+    try {
+        const result = await processAudio(fileInfo, chatId, messageToEditId);
+
+        if (result.success) {
+            const currentModel = await getUserModel(chatId);
+            const modelPrefix = currentModel === 'Vosk' ? "🚀 _Vosk_\n" : "🎯 _Whisper_\n";
+            let responseText = result.text 
+                ? `${modelPrefix}Вот что мне удалось услышать:\n\`\`\`\n${result.text}\n\`\`\`` 
+                : `${modelPrefix}Речь не распознана.`;
+
+            await deleteTelegramMessage(chatId, messageToEditId);
+            await sendTelegramMessage(chatId, responseText, null, true, messageId);
+        } else {
+            const errorText = `Ошибка: ${result.error || 'Не удалось обработать аудио.'}`;
+            if (messageToEditId) {
+                await editTelegramMessageText(chatId, messageToEditId, errorText);
+            } else {
+                await sendTelegramMessage(chatId, errorText);
+            }
+        }
+    } catch (err) {
+        console.error(`[Очередь] Ошибка выполнения задачи в чате ${chatId}:`, err);
+    } finally {
+        clearInterval(typingIntervalId);
+        state.isProcessing = false;
+        if (state.pendingAudio) {
+            const nextAudio = state.pendingAudio;
+            state.pendingAudio = null; 
+            console.log(`[Очередь] Предыдущая задача в чате ${chatId} завершена. Запускаем отложенное аудио.`);
+            
+            setImmediate(() => executeAudioProcessing(chatId, nextAudio.fileInfo, nextAudio.messageId));
+        }
+    }
+}
 
 async function getUserModel(userId) {
     try {
@@ -342,7 +422,6 @@ async function getUserModel(userId) {
         return 'Vosk';
     }
 }
-
 
 async function setUserModel(userId, model) {
     let models = {};
@@ -360,7 +439,6 @@ async function setUserModel(userId, model) {
     }
 }
 
-
 function pickModelEndpoint(modelName) {
     const modelLower = modelName.toLowerCase();
     if (modelLower === 'whisper' && WHISPER_ENDPOINT) {
@@ -376,14 +454,13 @@ async function cleanupTempFiles() {
     try {
         const files = await fs.readdir(TEMP_DIR);
         const now = Date.now();
-        const oneHour = 60 * 60 * 1000;
         const fiveMinutes = 5 * 60 * 1000;
 
         for (const file of files) {
             const filePath = path.join(TEMP_DIR, file);
             try {
                 const stats = await fs.stat(filePath);
-                if (now - stats.mtimeMs > fiveMinutes) {////////////
+                if (now - stats.mtimeMs > fiveMinutes) {
                     await fs.unlink(filePath);
                     console.log(`Deleted old temp file: ${filePath}`);
                 }
@@ -396,13 +473,18 @@ async function cleanupTempFiles() {
             console.error('Error during temp file cleanup:', error);
         }
     }
+
+    const now = Date.now();
+    for (const [id, time] of processedMediaGroups.entries()) {
+        if (now - time > 5 * 60 * 1000) {
+            processedMediaGroups.delete(id);
+        }
+    }
 }
-
-
 
 app.get('/health', async (req, res) => {
     return res.status(200).send('Server is alive');
-})
+});
 
 const webhookPath = '/webhook';
 app.post(webhookPath, async (req, res) => {
@@ -425,18 +507,33 @@ app.post(webhookPath, async (req, res) => {
     }
     const updateId = update.update_id;
     if (updateId != null) {
-        try {
-            let lastId = null;
-            try {
-                await fs.access(UPDATE_LOG_FILE);
-                lastId = parseInt(await fs.readFile(UPDATE_LOG_FILE, 'utf-8'), 10);
-            } catch (e) { }
+        if (lastProcessedUpdateId != null && updateId <= lastProcessedUpdateId) {
+            console.log(`Duplicate update_id (from memory): ${updateId} <= ${lastProcessedUpdateId}. Ignoring.`);
+            return res.sendStatus(200);
+        }
 
-            if (lastId != null && updateId <= lastId) {
-                console.log(`Duplicate update_id: ${updateId} <= ${lastId}. Ignoring.`);
+        try {
+            if (lastProcessedUpdateId === null) {
+                try {
+                    await fs.access(UPDATE_LOG_FILE);
+                    const fileData = await fs.readFile(UPDATE_LOG_FILE, 'utf-8');
+                    const lastIdFromFile = parseInt(fileData.trim(), 10);
+                    if (!isNaN(lastIdFromFile)) {
+                        lastProcessedUpdateId = lastIdFromFile;
+                    }
+                } catch (e) {
+                }
+            }
+            if (lastProcessedUpdateId != null && updateId <= lastProcessedUpdateId) {
+                console.log(`Duplicate update_id (from file): ${updateId} <= ${lastProcessedUpdateId}. Ignoring.`);
                 return res.sendStatus(200);
             }
-            await fs.writeFile(UPDATE_LOG_FILE, updateId.toString());
+
+            lastProcessedUpdateId = updateId;
+            fs.writeFile(UPDATE_LOG_FILE, updateId.toString()).catch(e => {
+                console.warn("⚠️ Warning: Failed to write update_id to disk (relying on memory cache instead):", e.message);
+            });
+
         } catch (e) {
             console.error("Error handling update_id log:", e);
         }
@@ -445,20 +542,18 @@ app.post(webhookPath, async (req, res) => {
     res.sendStatus(200);
 
     try {
-        let processingWarningMessageId;
         if (update.callback_query) {
             const cbq = update.callback_query;
             const chatId = cbq.message.chat.id;
             const messageId = cbq.message.message_id;
             const data = cbq.data;
 
-            if (chatId === audioProcessingId && isProcessing) {
-                if (processingWarningMessageCount === 0) {
-                    processingWarningMessageId = await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
-                    processingWarningMessageCount++;
-                }
+            const state = chatStates.get(chatId);
+            if (state && state.isProcessing) {
+                await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш предыдущий запрос всё еще обрабатывается.');
                 return;
             }
+
             if (data.startsWith('select_model:')) {
                 const model = data.substring('select_model:'.length);
                 await setUserModel(chatId, model);
@@ -469,13 +564,7 @@ app.post(webhookPath, async (req, res) => {
             const message = update.message;
             const chatId = message.chat.id;
             const messageId = message.message_id;
-            if (chatId === audioProcessingId && isProcessing) {
-                if (processingWarningMessageCount === 0) {
-                    processingWarningMessageId = await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш запрос обрабатывается.');
-                    processingWarningMessageCount++;
-                }
-                return;
-            }
+
             if (message.text) {
                 if (message.text === '/change_model') {
                     let text = "Выберите из нижеприведенных моделей:\n\n";
@@ -493,61 +582,29 @@ app.post(webhookPath, async (req, res) => {
                     const modelDescription = MODELS_INFO[currentModel] || "Неизвестная модель";
                     const text = `Ваша текущая модель:\n*${currentModel}* - ${modelDescription}`;
                     await sendTelegramMessage(chatId, text);
-                } 
-                
-                else {//for admin
-                    if (message.text === '/endpoints' && chatId == process.env.CHAT_ID){
-                        const text = `vosk: ${VOSK_ENDPOINT}\nwhisper: ${WHISPER_ENDPOINT}`;
-                        await sendTelegramMessage(chatId, text);
-                        return;
-                    }
+                } else if (message.text === '/endpoints' && String(chatId) === String(ADMIN_CHAT_ID)) {
+                    const text = `vosk: ${VOSK_ENDPOINT}\nwhisper: ${WHISPER_ENDPOINT}`;
+                    await sendTelegramMessage(chatId, text);
+                } else {
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                     await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
                 }
             } else if (message.voice || message.audio || (message.document && message.document.mime_type.startsWith('audio/'))) {
-                const fileInfo = message.voice || message.audio || message.document;
+                
 
-                const typingIntervalId = setInterval(() => {
-                    sendTelegramChatAction(chatId, 'typing');
-
-                }, 4000);
-                // await sendTelegramChatAction(chatId, 'typing');
-                const progressMessage = await sendTelegramMessage(chatId, "🎧 Обрабатываю аудио...");
-                const messageToEditId = progressMessage && progressMessage.ok ? progressMessage.result.message_id : null;
-
-
-
-                const result = await processAudio(fileInfo, chatId, messageToEditId).then(res => {
-                    isProcessing = false;
-                    audioProcessingId = null;
-                    processingWarningMessageCount = 0;
-                    clearInterval(typingIntervalId);
-                    return res;
-                });
-
-
-                if (result.success) {
-                    const currentModel = await getUserModel(chatId);
-                    const modelPrefix = currentModel === 'Vosk' ? "🚀_Vosk_\n" : "🎯_Whisper_\n";
-                    let responseText = result.text ? `${modelPrefix}Вот что мне удалось услышать:\n\`\`\`\n${result.text}\n\`\`\`` : `${modelPrefix}Речь не распознана.`;
-
-                    // if (messageToEditId) {
-                    //     await editTelegramMessageText(chatId, messageToEditId, responseText);
-                    // } else {
-                    //     await sendTelegramMessage(chatId, responseText);
-                    // }
-                    await deleteTelegramMessage(chatId, messageToEditId);
-                    processingWarningMessageId && await deleteTelegramMessage(chatId, processingWarningMessageId);
-
-                    await sendTelegramMessage(chatId, responseText, null, true, messageId);
-                } else {
-                    const errorText = `Ошибка: ${result.error || 'Не удалось обработать аудио.'}`;
-                    if (messageToEditId) {
-                        await editTelegramMessageText(chatId, messageToEditId, errorText);
-                    } else {
-                        await sendTelegramMessage(chatId, errorText);
+                const mediaGroupId = message.media_group_id;
+                if (mediaGroupId) {
+                    if (processedMediaGroups.has(mediaGroupId)) {
+                        console.log(`[MediaGroup] Игнорируем дубликат из пачки файлов: ID ${mediaGroupId}`);
+                        return;
                     }
+                    processedMediaGroups.set(mediaGroupId, Date.now());
                 }
+
+                const fileInfo = message.voice || message.audio || message.document;
+                
+                await handleIncomingAudio(chatId, fileInfo, messageId);
+
             } else {
                 const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                 await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
@@ -555,8 +612,6 @@ app.post(webhookPath, async (req, res) => {
         }
     } catch (error) {
         console.error("Error processing update:", error);
-        // Optionally, send a generic error message to the user if a chatId is available
-        if (chatId) await sendTelegramMessage(chatId, "Произошла внутренняя ошибка. Попробуйте позже.");
     }
 });
 
@@ -573,31 +628,27 @@ async function startServer() {
         console.warn("WARNING: Neither VOSK_ENDPOINT nor WHISPER_ENDPOINT are defined. ASR functionality will be limited.");
     }
 
-
     await ensureDir(TEMP_DIR);
 
-    // Set webhook with Telegram
     const fullWebhookUrl = `${WEBHOOK_URL.replace(/\/$/, '')}${webhookPath}`;
-    // try {
-    //     const webhookPayload = { url: fullWebhookUrl };
-    //     if (SECRET_TOKEN) {
-    //         webhookPayload.secret_token = SECRET_TOKEN;
-    //     }
-    //     const tgWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
-    //     const options = requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(webhookPayload));
-    //     const response = await fetch(tgWebhookUrl, options);
-    //     const responseData = await response.json();
-    //     if (response.ok && responseData.ok) {
-    //         console.log(`Webhook set successfully to: ${fullWebhookUrl}`);
-    //         console.log(`Telegram response: ${responseData.description}`);
-    //     } else {
-    //         console.error('Failed to set Telegram webhook:');
-    //         console.error(`Status: ${response.status}`);
-    //         console.error('Response:', responseData);
-    //     }
-    // } catch (error) {
-    //     console.error('Error setting Telegram webhook:', error);
-    // }
+    try {
+        const webhookPayload = { url: fullWebhookUrl };
+        if (SECRET_TOKEN) {
+            webhookPayload.secret_token = SECRET_TOKEN;
+        }
+        const tgWebhookUrl = `https://api.telegram.org/bot${BOT_TOKEN}/setWebhook`;
+        const options = requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(webhookPayload));
+        const response = await fetch(tgWebhookUrl, options);
+        const responseData = await response.json();
+        if (response.ok && responseData.ok) {
+            console.log(`Webhook set successfully to: ${fullWebhookUrl}`);
+            console.log(`Telegram response: ${responseData.description}`);
+        } else {
+            console.error('Failed to set Telegram webhook:', responseData);
+        }
+    } catch (error) {
+        console.error('Error setting Telegram webhook:', error);
+    }
 
     app.listen(PORT, () => {
         console.log(`Server listening on port ${PORT}`);
@@ -608,21 +659,7 @@ async function startServer() {
     });
 }
 
-import('node-fetch')
-    .then(module => {
-        fetch = module.default; // Assign the default export (the fetch function)
-        if (typeof fetch !== 'function') {
-            // This check is a safeguard, module.default should be the function for node-fetch v3+
-            console.error("Failed to load fetch function from node-fetch. Ensure 'node-fetch' is installed correctly (v3+ expected).");
-            process.exit(1);
-        }
-        // Now that fetch is initialized, start the server
-        startServer().catch(err => {
-            console.error("Failed to start server:", err);
-            process.exit(1);
-        });
-    })
-    .catch(err => {
-        console.error("Failed to dynamically import node-fetch. Make sure 'node-fetch' is installed.", err);
-        process.exit(1);
-    });
+startServer().catch(err => {
+    console.error("Failed to start server:", err);
+    process.exit(1);
+});
