@@ -16,6 +16,7 @@ app.use(express.json());
 
 const chatStates = new Map();  
 const processedMediaGroups = new Map(); 
+const geminiModelsCache = new Map(); // Словарь для коротких ID кнопок Gemini
 let lastProcessedUpdateId = null;
 
 // --- Configuration ---
@@ -25,7 +26,7 @@ const WHISPER_ENDPOINT = process.env.WHISPER_ENDPOINT;
 const SECRET_TOKEN = process.env.SECRET_TOKEN;
 const PORT = process.env.PORT || process.env.SERVER_PORT || 7860;
 const WEBHOOK_URL = process.env.WEBHOOK;
-const ADMIN_CHAT_ID = process.env.CHAT_ID; // admin ID for logs
+const ADMIN_CHAT_ID = process.env.CHAT_ID;
 
 const TEMP_DIR = path.join(__dirname, 'tmp_audio');
 const MAX_FILE_SIZE = 16 * 1024 * 1024; // 16 MB
@@ -38,7 +39,8 @@ process.env.TMP = TEMP_DIR;
 
 const MODELS_INFO = {
     'Vosk': '🚀 Быстрая, но менее точная',
-    'Whisper': '🎯 Больше точность, но меньше скорость'
+    'Whisper': '🎯 Больше точность, но меньше скорость',
+    'Gemini': '✨ Умная (требует API ключ)'
 };
 
 function requestOptionsBuilder(method, headers, body) {
@@ -62,7 +64,6 @@ async function ensureDir(dirPath) {
     }
 }
 
-//logging
 async function sendAdminLog(logText) {
     if (!ADMIN_CHAT_ID) return;
     try {
@@ -74,14 +75,6 @@ async function sendAdminLog(logText) {
 
 // Middleware
 app.use((req, res, next) => {
-    require('dns').resolve('api.telegram.org', (err, addresses) => {
-        if (err) {
-            console.error('❌ DNS RESOLVE ERROR:', err);
-        } else {
-            console.log('✅ Telegram resolved to:', addresses);
-        }
-    });
-
     if (req.method === 'HEAD' || req.originalUrl === '/health') {
         return next();
     }
@@ -100,17 +93,6 @@ app.use((req, res, next) => {
 
     const log = `[${moscowTime}] ${req.method} user ${JSON.stringify(user)} chatId ${chatId} ${cmd} ${req.originalUrl}`;
     console.log(log);
-
-    if (process.env.GOOGLE_SCRIPT_URL) {
-        const data = {
-            time: moscowTime,
-            request: req.method,
-            user: JSON.stringify(user),
-            chatId: chatId,
-            cmd: cmd,
-            url: req.originalUrl
-        };
-    }
 
     if (chatId && String(chatId) !== String(ADMIN_CHAT_ID)) {
         sendAdminLog(log).catch(err => console.error('Error in sendAdminLog:', err));
@@ -154,7 +136,7 @@ async function sendTelegramMessage(chatId, text, keyboard = null, reply = false,
     }
 }
 
-async function editTelegramMessageText(chatId, messageId, text, markdown = true) {
+async function editTelegramMessageText(chatId, messageId, text, markdown = true, inlineKeyboard = null) {
     const url = `https://api.telegram.org/bot${BOT_TOKEN}/editMessageText`;
     const payload = {
         chat_id: chatId,
@@ -163,6 +145,9 @@ async function editTelegramMessageText(chatId, messageId, text, markdown = true)
     };
     if (markdown) {
         payload.parse_mode = 'Markdown';
+    }
+    if (inlineKeyboard) {
+        payload.reply_markup = { inline_keyboard: inlineKeyboard };
     }
     try {
         const options = requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(payload));
@@ -216,37 +201,29 @@ async function downloadTelegramFile(fileId) {
         const fileInfoResponse = await fetch(getFileUrl);
         if (!fileInfoResponse.ok) {
             const error = await fileInfoResponse.text();
-            console.error('Failed to get file info from Telegram:', error);
             return { status: false, error: error };
         }
         const fileInfo = await fileInfoResponse.json();
         if (!fileInfo.ok || !fileInfo.result.file_path) {
-            const error = `Invalid file info response from Telegram: ${JSON.stringify(fileInfo)}`;
-            console.error(error);
-            return { status: false, error: error };
+            return { status: false, error: `Invalid file info response` };
         }
 
         const filePathOnTelegram = fileInfo.result.file_path;
         const fileSize = fileInfo.result.file_size;
 
         if (fileSize > MAX_FILE_SIZE) {
-            const error = `Размер файла превышает максимальный размер ${MAX_FILE_SIZE / (1024 * 1024)}Мб.`;
-            console.warn(`File ${fileId} exceeds max size: ${fileSize} > ${MAX_FILE_SIZE}`);
-            return { status: false, error: error };
+            return { status: false, error: `Размер файла превышает максимальный размер ${MAX_FILE_SIZE / (1024 * 1024)}Мб.` };
         }
 
         const downloadUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePathOnTelegram}`;
         const fileResponse = await fetch(downloadUrl);
         if (!fileResponse.ok) {
-            const error = await fileResponse.text();
-            console.error('Failed to download file from Telegram:', error);
-            return { status: false, error: error };
+            return { status: false, error: await fileResponse.text() };
         }
 
         const uniquePrefix = crypto.randomBytes(8).toString('hex');
         const localPath = path.join(TEMP_DIR, `${uniquePrefix}_${path.basename(filePathOnTelegram)}`);
 
-        // ИЗМЕНЕНО: Возвращаем надежный Node.js .pipe() для node-fetch
         const fileStream = fsSync.createWriteStream(localPath);
         await new Promise((resolve, reject) => {
             fileResponse.body.pipe(fileStream);
@@ -280,15 +257,131 @@ function convertToWav(inputPath) {
     });
 }
 
-async function sendToAsr(audioPath, userId) {
+// Получение конфигурации модели и ключей пользователя
+async function getUserModelConfig(userId) {
     try {
-        const userModel = await getUserModel(userId);
-        const asrEndpoint = pickModelEndpoint(userModel);
-
-        if (!asrEndpoint) {
-            console.error(`ASR endpoint not configured for model: ${userModel}`);
-            return false;
+        await fs.access(USER_MODELS_FILE);
+        const data = await fs.readFile(USER_MODELS_FILE, 'utf-8');
+        const models = JSON.parse(data);
+        const config = models[userId];
+        
+        if (typeof config === 'string') {
+            return { model: config, geminiKey: null, geminiUsage: 0 };
         }
+        if (config && typeof config === 'object') {
+            return {
+                model: typeof config.model === 'string' ? config.model : 'Vosk',
+                geminiKey: config.geminiKey || null,
+                geminiUsage: config.geminiUsage || 0,
+                requestsToday: config.requestsToday || 0,
+                tokensToday: config.tokensToday || 0,
+                lastUsageDate: config.lastUsageDate || null,
+                inputTokenLimit: config.inputTokenLimit || 1048576,
+                ...config
+            };
+        }
+        return { model: 'Vosk', geminiKey: null, geminiUsage: 0 };
+    } catch (error) {
+        return { model: 'Vosk', geminiKey: null, geminiUsage: 0 };
+    }
+}
+
+async function setUserModelConfig(userId, newConfig) {
+    let models = {};
+    try {
+        await fs.access(USER_MODELS_FILE);
+        const data = await fs.readFile(USER_MODELS_FILE, 'utf-8');
+        models = JSON.parse(data);
+    } catch (error) {}
+    
+    let currentConfig = models[userId];
+    if (typeof currentConfig === 'string') {
+        currentConfig = { model: currentConfig, geminiKey: null, geminiUsage: 0 };
+    } else if (!currentConfig || typeof currentConfig !== 'object') {
+        currentConfig = { model: 'Vosk', geminiKey: null, geminiUsage: 0 };
+    }
+    
+    // Гарантируем наличие модели по умолчанию
+    if (!currentConfig.model) {
+        currentConfig.model = 'Vosk';
+    }
+    
+    models[userId] = { ...currentConfig, ...newConfig };
+    
+    try {
+        await fs.writeFile(USER_MODELS_FILE, JSON.stringify(models, null, 2));
+    } catch (error) {
+        console.error("Error writing user models file:", error);
+    }
+}
+
+// -------------------------------------------------------------
+// ДИНАМИЧЕСКИЕ МЕНЮ И КЛАВИАТУРЫ
+// -------------------------------------------------------------
+
+async function getUserReplyKeyboard(chatId) {
+    const config = await getUserModelConfig(chatId);
+    const model = String(config.model || 'Vosk');
+    const isGemini = model.startsWith('models/gemini') || model === 'Gemini';
+
+    const keyboard = [
+        [{ text: '🔄 Сменить модель' }, { text: 'ℹ️ Моя модель' }]
+    ];
+
+    if (isGemini) {
+        keyboard.push([{ text: '📊 Проверить квоты' }]);
+    }
+
+    return {
+        keyboard: keyboard,
+        resize_keyboard: true,
+        persistent: true
+    };
+}
+
+async function updateUserCommandsMenu(chatId) {
+    const config = await getUserModelConfig(chatId);
+    const model = String(config.model || 'Vosk');
+    const isGemini = model.startsWith('models/gemini') || model === 'Gemini';
+
+    const commands = [
+        { command: 'change_model', description: 'Сменить модель распознавания' },
+        { command: 'model', description: 'Текущая модель' }
+    ];
+
+    if (isGemini) {
+        commands.push({ command: 'quota', description: 'Проверить расход квот Gemini' });
+    }
+
+    try {
+        const url = `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`;
+        const payload = {
+            commands: commands,
+            scope: {
+                type: 'chat',
+                chat_id: chatId
+            }
+        };
+        await fetch(url, requestOptionsBuilder('POST', { 'Content-Type': 'application/json' }, JSON.stringify(payload)));
+    } catch (e) {
+        console.error('Error updating chat commands:', e);
+    }
+}
+
+function pickModelEndpoint(modelName) {
+    const modelLower = modelName.toLowerCase();
+    if (modelLower === 'whisper' && WHISPER_ENDPOINT) {
+        return `${WHISPER_ENDPOINT}/transcribe`;
+    } else if (modelLower === 'vosk' && VOSK_ENDPOINT) {
+        return `${VOSK_ENDPOINT}/transcribe`;
+    }
+    return `${VOSK_ENDPOINT}/transcribe`;
+}
+
+async function sendToAsr(audioPath, modelName) {
+    try {
+        const asrEndpoint = pickModelEndpoint(modelName);
+        if (!asrEndpoint) return false;
 
         const form = new FormData();
         form.append('audio', fsSync.createReadStream(audioPath), {
@@ -311,20 +404,218 @@ async function sendToAsr(audioPath, userId) {
     }
 }
 
+async function sendToGemini(audioPath, modelName, apiKey) {
+    try {
+        const stats = await fs.stat(audioPath);
+        if (stats.size > 14 * 1024 * 1024) {
+             return { success: false, error: 'Размер аудио превышает лимит Gemini для прямых запросов (макс ~7 минут). Пожалуйста, используйте более короткое аудио.' };
+        }
+
+        const audioBuffer = await fs.readFile(audioPath);
+        const base64Audio = audioBuffer.toString('base64');
+        const endpointModel = modelName.startsWith('models/') ? modelName : `models/${modelName}`;
+
+        const payload = {
+            contents: [{
+                parts: [
+                    { text: "Сделай максимально точную транскрибацию (speech-to-text) этого аудио на языке оригинала. Верни только распознанный текст без каких-либо дополнительных комментариев и вступлений." },
+                    {
+                        inlineData: {
+                            mimeType: "audio/wav",
+                            data: base64Audio
+                        }
+                    }
+                ]
+            }]
+        };
+
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/${endpointModel}:generateContent?key=${apiKey}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        });
+
+        const data = await res.json();
+        
+        if (!res.ok) {
+            console.error('Gemini API Error:', data);
+            return { success: false, error: data.error?.message || 'Ошибка Gemini API' };
+        }
+
+        const text = data.candidates?.[0]?.content?.parts?.[0]?.text || '';
+        const usage = data.usageMetadata?.totalTokenCount || 0;
+
+        return { success: true, text: text.trim(), tokens: usage };
+    } catch (err) {
+        console.error('Gemini send error:', err);
+        return { success: false, error: err.message };
+    }
+}
+
+async function fetchGeminiModels(apiKey) {
+    try {
+        const res = await fetch(`https://generativelanguage.googleapis.com/v1beta/models?key=${apiKey}`);
+        if (!res.ok) return null;
+        const data = await res.json();
+        if (!data.models) return null;
+        return data.models.filter(m => m.supportedGenerationMethods && m.supportedGenerationMethods.includes('generateContent'));
+    } catch (e) {
+        console.error('Error fetching models:', e);
+        return null;
+    }
+}
+
+function formatCompactNumber(num) {
+    if (!num || num === 0) return '0';
+    if (num >= 1000000) return (num / 1000000).toFixed(1).replace('.0', '') + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(1).replace('.0', '') + 'k';
+    return String(num);
+}
+
+function getRateLimits(modelName) {
+    const name = modelName.toLowerCase();
+    
+    if (name.includes('pro')) {
+        return {
+            type: 'Pro',
+            icon: '🎯',
+            rpmBadge: '2 RPM',
+            rpdBadge: '50/день',
+            rpm: 2,
+            rpd: 50,
+            tpm: '32 000'
+        };
+    }
+    
+    return {
+        type: 'Flash',
+        icon: '⚡',
+        rpmBadge: '15 RPM',
+        rpdBadge: '1.5k/день',
+        rpm: 15,
+        rpd: 1500,
+        tpm: '1 000 000'
+    };
+}
+
+async function showGeminiModels(chatId, apiKey, messageId = null) {
+    const models = await fetchGeminiModels(apiKey);
+    if (!models) {
+        const text = "❌ Ошибка при получении моделей. Возможно, API ключ недействителен или недоступен сервер.";
+        if (messageId) {
+            await editTelegramMessageText(chatId, messageId, text, false);
+        } else {
+            await sendTelegramMessage(chatId, text);
+        }
+        return;
+    }
+
+    const userConfig = await getUserModelConfig(chatId);
+    const todayStr = new Date().toISOString().slice(0, 10);
+    
+    const requestsToday = (userConfig.lastUsageDate === todayStr) ? (userConfig.requestsToday || 0) : 0;
+    const tokensToday = (userConfig.lastUsageDate === todayStr) ? (userConfig.tokensToday || 0) : 0;
+    const formattedTokens = formatCompactNumber(tokensToday);
+
+    let text = `✨ *Выберите модель Gemini:*\n` +
+               `📅 *Ваш расход сегодня (${todayStr}):* *${requestsToday}* запр. | *${tokensToday.toLocaleString('ru-RU')}* токенов\n\n` +
+               `_На кнопках указан текущий расход относительно лимитов каждой модели:_`;
+               
+    const inline_keyboard_rows = [];
+    
+    for (const m of models) {
+        const shortId = crypto.randomBytes(4).toString('hex');
+        
+        geminiModelsCache.set(shortId, {
+            name: m.name,
+            displayName: m.displayName || m.name.replace('models/', ''),
+            inputTokenLimit: m.inputTokenLimit || 1048576,
+            outputTokenLimit: m.outputTokenLimit || 8192
+        });
+
+        const limits = getRateLimits(m.name);
+        const title = m.displayName || m.name.replace('models/', '');
+        
+        const isCurrent = userConfig.model === m.name;
+        const activeBadge = isCurrent ? ' [Активна ✅]' : '';
+
+        const line1 = `${limits.icon} ${title}${activeBadge}`;
+        const line2 = `📊 Сегодня: ${requestsToday}/${limits.rpdBadge} • ${formattedTokens} ток • ${limits.rpmBadge}`;
+
+        const buttonText = `${line1}\n${line2}`;
+
+        inline_keyboard_rows.push([{
+            text: buttonText,
+            callback_data: `gmid:${shortId}`
+        }]);
+    }
+    
+    inline_keyboard_rows.push([{
+        text: '🔑 Изменить API ключ',
+        callback_data: `change_gemini_key`
+    }]);
+
+    if (messageId) {
+        await editTelegramMessageText(chatId, messageId, text, true, inline_keyboard_rows);
+    } else {
+        await sendTelegramMessage(chatId, text, { inline_keyboard: inline_keyboard_rows });
+    }
+}
+
+async function showQuotaInfo(chatId) {
+    const config = await getUserModelConfig(chatId);
+    const isGemini = config.model.startsWith('models/gemini') || config.model === 'Gemini';
+
+    const keyboard = await getUserReplyKeyboard(chatId);
+
+    if (!isGemini) {
+        await sendTelegramMessage(chatId, "⚠️ Квоты доступны только при активной модели *Gemini*.", keyboard);
+        return;
+    }
+
+    const todayStr = new Date().toISOString().slice(0, 10);
+    const requestsToday = (config.lastUsageDate === todayStr) ? (config.requestsToday || 0) : 0;
+    const tokensToday = (config.lastUsageDate === todayStr) ? (config.tokensToday || 0) : 0;
+    const totalTokens = config.geminiUsage || 0;
+    
+    const cleanModelName = config.model.replace('models/', '');
+    const rateLimits = getRateLimits(cleanModelName);
+    const maxContext = config.inputTokenLimit 
+        ? `${(config.inputTokenLimit >= 1000000 ? (config.inputTokenLimit / 1000000).toFixed(0) + 'M' : Math.round(config.inputTokenLimit / 1000) + 'k')} токенов` 
+        : '1M токенов';
+
+    const text = `📊 *Лимиты и квоты: ${cleanModelName}*\n` +
+                 `🏷 _Тип: ${rateLimits.type}_\n\n` +
+                 `📅 *Использование за сегодня (${todayStr}):*\n` +
+                 `• Запросов: *${requestsToday}* / *${rateLimits.rpdBadge}*\n` +
+                 `• Токенов: *${tokensToday.toLocaleString('ru-RU')}*\n\n` +
+                 `📈 *Всего за всё время:*\n` +
+                 `• Токенов: *${totalTokens.toLocaleString('ru-RU')}*\n\n` +
+                 `⚙️ *Установленные лимиты Google (Free Tier):*\n` +
+                 `• В минуту (RPM): *${rateLimits.rpm} запр/мин*\n` +
+                 `• В день (RPD): *${rateLimits.rpd} запр/день*\n` +
+                 `• Токенов в минуту (TPM): *${rateLimits.tpm}*\n` +
+                 `• Макс. длина аудио (контекст): *${maxContext}*\n\n` +
+                 `💡 _Для платных ключей (Pay-as-you-go) суточный лимит не ограничен._`;
+
+    await sendTelegramMessage(chatId, text, keyboard);
+}
+
 async function processAudio(fileInfo, chatId, messageToEditId = null) {
     const fileId = fileInfo.file_id;
     let localFilePath = null;
     let wavPath = null;
     let downloadTelegramFileStatus = null;
+    
     try {
         downloadTelegramFileStatus = await downloadTelegramFile(fileId);
         if (!downloadTelegramFileStatus.status) {
-            return { success: false, error: 'Не удалось загрузить файл из Telegram' };
+            return { success: false, error: downloadTelegramFileStatus.error || 'Не удалось загрузить файл из Telegram' };
         }
         localFilePath = downloadTelegramFileStatus.path;
         await sendTelegramChatAction(chatId, 'typing');
         if (messageToEditId) {
-            await editTelegramMessageText(chatId, messageToEditId, "🔍 Распознаю речь...");
+            await editTelegramMessageText(chatId, messageToEditId, "🔍 Распознаю речь...", false);
         }
 
         wavPath = await convertToWav(localFilePath);
@@ -332,8 +623,20 @@ async function processAudio(fileInfo, chatId, messageToEditId = null) {
             return { success: false, error: 'Ошибка конвертации аудио в формат WAV' };
         }
 
-        const transcribedText = await sendToAsr(wavPath, chatId);
-        return { success: true, text: transcribedText };
+        const config = await getUserModelConfig(chatId);
+        let modelName = config.model;
+
+        if (modelName === 'Gemini') modelName = 'models/gemini-1.5-flash';
+
+        if (modelName.startsWith('models/gemini')) {
+            if (!config.geminiKey) {
+                return { success: false, error: 'API ключ Gemini не установлен. Используйте /change_model для настройки.' };
+            }
+            return await sendToGemini(wavPath, modelName, config.geminiKey);
+        } else {
+            const transcribedText = await sendToAsr(wavPath, modelName);
+            return transcribedText ? { success: true, text: transcribedText } : { success: false, error: 'Ошибка распознавания' };
+        }
 
     } catch (error) {
         console.error('Error in processAudio:', error);
@@ -346,19 +649,17 @@ async function processAudio(fileInfo, chatId, messageToEditId = null) {
 
 async function handleIncomingAudio(chatId, fileInfo, messageId) {
     if (!chatStates.has(chatId)) {
-        chatStates.set(chatId, { isProcessing: false, pendingAudio: null });
+        chatStates.set(chatId, { isProcessing: false, pendingAudio: null, awaitingGeminiKey: false });
     }
     const state = chatStates.get(chatId);
+    state.awaitingGeminiKey = false; 
 
     if (state.isProcessing) {
-        // Если бот занят, сохраняем присланное аудио (перезаписывая предыдущее ожидающее)
         const hadPreviousPending = state.pendingAudio !== null;
         state.pendingAudio = { fileInfo, messageId };
-        console.log(`[Очередь] Чат ${chatId} занят. Новое аудио добавлено в очередь (предыдущие ожидающие перезаписаны).`);
         
-        // Отправляем предупреждение только один раз, чтобы не спамить в чат
         if (!hadPreviousPending) {
-            await sendTelegramMessage(chatId, "⏳ *Бот сейчас обрабатывает ваше предыдущее аудио.* Новое сообщение добавлено в очередь и будет обработано сразу после текущего.");
+            await sendTelegramMessage(chatId, "⏳ *Бот сейчас обрабатывает ваше предыдущее аудио.* Новое сообщение добавлено в очередь.");
         }
         return;
     }
@@ -381,8 +682,31 @@ async function executeAudioProcessing(chatId, fileInfo, messageId) {
         const result = await processAudio(fileInfo, chatId, messageToEditId);
 
         if (result.success) {
-            const currentModel = await getUserModel(chatId);
-            const modelPrefix = currentModel === 'Vosk' ? "🚀 _Vosk_\n" : "🎯 _Whisper_\n";
+            const currentModelConfig = await getUserModelConfig(chatId);
+            const isGemini = currentModelConfig.model.startsWith('models/gemini') || currentModelConfig.model === 'Gemini';
+            
+            let modelPrefix;
+            if (isGemini) {
+                const todayStr = new Date().toISOString().slice(0, 10);
+                const isNewDay = currentModelConfig.lastUsageDate !== todayStr;
+                
+                const newTotalUsage = (currentModelConfig.geminiUsage || 0) + (result.tokens || 0);
+                const newDailyRequests = isNewDay ? 1 : ((currentModelConfig.requestsToday || 0) + 1);
+                const newDailyTokens = isNewDay ? (result.tokens || 0) : ((currentModelConfig.tokensToday || 0) + (result.tokens || 0));
+
+                await setUserModelConfig(chatId, { 
+                    geminiUsage: newTotalUsage,
+                    requestsToday: newDailyRequests,
+                    tokensToday: newDailyTokens,
+                    lastUsageDate: todayStr
+                });
+
+                const limits = getRateLimits(currentModelConfig.model);
+                modelPrefix = `✨ _Gemini_ (Запрос: ${result.tokens || 0} ток. | Сегодня: ${newDailyRequests}/${limits.rpdBadge})\n`;
+            } else {
+                modelPrefix = currentModelConfig.model === 'Vosk' ? "🚀 _Vosk_\n" : "🎯 _Whisper_\n";
+            }
+
             let responseText = result.text 
                 ? `${modelPrefix}Вот что мне удалось услышать:\n\`\`\`\n${result.text}\n\`\`\`` 
                 : `${modelPrefix}Речь не распознана.`;
@@ -392,7 +716,7 @@ async function executeAudioProcessing(chatId, fileInfo, messageId) {
         } else {
             const errorText = `Ошибка: ${result.error || 'Не удалось обработать аудио.'}`;
             if (messageToEditId) {
-                await editTelegramMessageText(chatId, messageToEditId, errorText);
+                await editTelegramMessageText(chatId, messageToEditId, errorText, false);
             } else {
                 await sendTelegramMessage(chatId, errorText);
             }
@@ -405,49 +729,9 @@ async function executeAudioProcessing(chatId, fileInfo, messageId) {
         if (state.pendingAudio) {
             const nextAudio = state.pendingAudio;
             state.pendingAudio = null; 
-            console.log(`[Очередь] Предыдущая задача в чате ${chatId} завершена. Запускаем отложенное аудио.`);
-            
             setImmediate(() => executeAudioProcessing(chatId, nextAudio.fileInfo, nextAudio.messageId));
         }
     }
-}
-
-async function getUserModel(userId) {
-    try {
-        await fs.access(USER_MODELS_FILE);
-        const data = await fs.readFile(USER_MODELS_FILE, 'utf-8');
-        const models = JSON.parse(data);
-        return models[userId] || 'Vosk';
-    } catch (error) {
-        return 'Vosk';
-    }
-}
-
-async function setUserModel(userId, model) {
-    let models = {};
-    try {
-        await fs.access(USER_MODELS_FILE);
-        const data = await fs.readFile(USER_MODELS_FILE, 'utf-8');
-        models = JSON.parse(data);
-    } catch (error) {
-    }
-    models[userId] = model;
-    try {
-        await fs.writeFile(USER_MODELS_FILE, JSON.stringify(models, null, 2));
-    } catch (error) {
-        console.error("Error writing user models file:", error);
-    }
-}
-
-function pickModelEndpoint(modelName) {
-    const modelLower = modelName.toLowerCase();
-    if (modelLower === 'whisper' && WHISPER_ENDPOINT) {
-        return `${WHISPER_ENDPOINT}/transcribe`;
-    } else if (modelLower === 'vosk' && VOSK_ENDPOINT) {
-        return `${VOSK_ENDPOINT}/transcribe`;
-    }
-    console.warn(`Endpoint not found or not configured for model: ${modelName}`);
-    return `${VOSK_ENDPOINT}/transcribe`;
 }
 
 async function cleanupTempFiles() {
@@ -462,17 +746,10 @@ async function cleanupTempFiles() {
                 const stats = await fs.stat(filePath);
                 if (now - stats.mtimeMs > fiveMinutes) {
                     await fs.unlink(filePath);
-                    console.log(`Deleted old temp file: ${filePath}`);
                 }
-            } catch (statErr) {
-                console.warn(`Could not stat/delete temp file ${filePath}:`, statErr.message);
-            }
+            } catch (statErr) {}
         }
-    } catch (error) {
-        if (error.code !== 'ENOENT') {
-            console.error('Error during temp file cleanup:', error);
-        }
-    }
+    } catch (error) {}
 
     const now = Date.now();
     for (const [id, time] of processedMediaGroups.entries()) {
@@ -482,61 +759,27 @@ async function cleanupTempFiles() {
     }
 }
 
-app.get('/health', async (req, res) => {
-    return res.status(200).send('Server is alive');
-});
+app.get('/health', async (req, res) => res.status(200).send('Server is alive'));
 
 const webhookPath = '/webhook';
 app.post(webhookPath, async (req, res) => {
     if (SECRET_TOKEN) {
         const receivedToken = req.headers['x-telegram-bot-api-secret-token'];
         if (receivedToken !== SECRET_TOKEN) {
-            console.warn('Unauthorized: Invalid Secret Token');
             return res.status(403).send('Access denied');
         }
     }
 
     const update = req.body;
+    if (!update) return res.status(400).send('Bad Request');
 
-    if (!update) {
-        console.warn('Bad Request: Received empty update body');
-        return res.status(400).send('Bad Request');
-    }
-    if (update.message == null && update.callback_query == null) {
-        console.log('Received an update type that is not a message or callback query. Update content:', update);
-    }
     const updateId = update.update_id;
     if (updateId != null) {
         if (lastProcessedUpdateId != null && updateId <= lastProcessedUpdateId) {
-            console.log(`Duplicate update_id (from memory): ${updateId} <= ${lastProcessedUpdateId}. Ignoring.`);
             return res.sendStatus(200);
         }
-
-        try {
-            if (lastProcessedUpdateId === null) {
-                try {
-                    await fs.access(UPDATE_LOG_FILE);
-                    const fileData = await fs.readFile(UPDATE_LOG_FILE, 'utf-8');
-                    const lastIdFromFile = parseInt(fileData.trim(), 10);
-                    if (!isNaN(lastIdFromFile)) {
-                        lastProcessedUpdateId = lastIdFromFile;
-                    }
-                } catch (e) {
-                }
-            }
-            if (lastProcessedUpdateId != null && updateId <= lastProcessedUpdateId) {
-                console.log(`Duplicate update_id (from file): ${updateId} <= ${lastProcessedUpdateId}. Ignoring.`);
-                return res.sendStatus(200);
-            }
-
-            lastProcessedUpdateId = updateId;
-            fs.writeFile(UPDATE_LOG_FILE, updateId.toString()).catch(e => {
-                console.warn("⚠️ Warning: Failed to write update_id to disk (relying on memory cache instead):", e.message);
-            });
-
-        } catch (e) {
-            console.error("Error handling update_id log:", e);
-        }
+        lastProcessedUpdateId = updateId;
+        fs.writeFile(UPDATE_LOG_FILE, updateId.toString()).catch(() => {});
     }
 
     res.sendStatus(200);
@@ -548,25 +791,112 @@ app.post(webhookPath, async (req, res) => {
             const messageId = cbq.message.message_id;
             const data = cbq.data;
 
+            if (!chatStates.has(chatId)) {
+                chatStates.set(chatId, { isProcessing: false, pendingAudio: null, awaitingGeminiKey: false });
+            }
             const state = chatStates.get(chatId);
-            if (state && state.isProcessing) {
-                await sendTelegramMessage(chatId, 'Пожалуйста, подождите, ваш предыдущий запрос всё еще обрабатывается.');
+
+            if (state.isProcessing) {
+                await answerTelegramCallbackQuery(cbq.id, 'Пожалуйста, подождите, ваш предыдущий запрос всё еще обрабатывается.');
                 return;
             }
 
-            if (data.startsWith('select_model:')) {
+            if (data === 'select_model:Gemini') {
+                const config = await getUserModelConfig(chatId);
+                if (!config.geminiKey) {
+                    state.awaitingGeminiKey = true;
+                    await editTelegramMessageText(chatId, messageId, `Пожалуйста, отправьте ваш API ключ от Gemini (Google AI Studio) или введите /cancel:`, false);
+                } else {
+                    await showGeminiModels(chatId, config.geminiKey, messageId);
+                }
+                await answerTelegramCallbackQuery(cbq.id, '');
+            } else if (data.startsWith('gmid:')) {
+                const shortId = data.substring('gmid:'.length);
+                const modelInfo = geminiModelsCache.get(shortId);
+                
+                if (!modelInfo) {
+                    await answerTelegramCallbackQuery(cbq.id, 'Меню устарело. Вызовите /change_model заново.');
+                    return;
+                }
+
+                const fullModelName = typeof modelInfo === 'object' ? modelInfo.name : modelInfo;
+                const inputLimit = typeof modelInfo === 'object' ? modelInfo.inputTokenLimit : 1048576;
+                const displayModel = fullModelName.replace('models/', '');
+
+                // Сохраняем модель и её технический лимит контекста
+                await setUserModelConfig(chatId, { 
+                    model: fullModelName,
+                    inputTokenLimit: inputLimit
+                });
+                
+                await updateUserCommandsMenu(chatId);
+                
+                await answerTelegramCallbackQuery(cbq.id, `Вы выбрали: ${displayModel}`);
+                await editTelegramMessageText(chatId, messageId, `Вы выбрали модель Gemini: *${displayModel}*.`, true);
+                
+                const keyboard = await getUserReplyKeyboard(chatId);
+                await sendTelegramMessage(chatId, `🎉 Активна модель *${displayModel}*. В меню доступна кнопка проверки квот!`, keyboard);
+            } else if (data === 'change_gemini_key') {
+                state.awaitingGeminiKey = true;
+                await editTelegramMessageText(chatId, messageId, `Отправьте новый API ключ от Gemini:`, false);
+                await answerTelegramCallbackQuery(cbq.id, '');
+            } else if (data.startsWith('select_model:')) {
                 const model = data.substring('select_model:'.length);
-                await setUserModel(chatId, model);
+                await setUserModelConfig(chatId, { model: model });
+                await updateUserCommandsMenu(chatId);
+                
                 await answerTelegramCallbackQuery(cbq.id, `Вы выбрали модель: ${model}`);
                 await editTelegramMessageText(chatId, messageId, `Вы выбрали модель: *${model}*.`, true);
+
+                const keyboard = await getUserReplyKeyboard(chatId);
+                await sendTelegramMessage(chatId, `Модель *${model}* успешно установлена.`, keyboard);
             }
         } else if (update.message) {
             const message = update.message;
             const chatId = message.chat.id;
             const messageId = message.message_id;
 
+            if (!chatStates.has(chatId)) {
+                chatStates.set(chatId, { isProcessing: false, pendingAudio: null, awaitingGeminiKey: false });
+            }
+            const state = chatStates.get(chatId);
+
             if (message.text) {
-                if (message.text === '/change_model') {
+                if (state.awaitingGeminiKey) {
+                    const key = message.text.trim();
+                    if (key === '/cancel') {
+                        state.awaitingGeminiKey = false;
+                        const keyboard = await getUserReplyKeyboard(chatId);
+                        await sendTelegramMessage(chatId, "Ввод ключа отменен.", keyboard);
+                        return;
+                    }
+                    
+                    const progressMessage = await sendTelegramMessage(chatId, "⏳ Проверяю ключ и получаю доступные модели...");
+                    const models = await fetchGeminiModels(key);
+                    
+                    if (models && models.length > 0) {
+                        state.awaitingGeminiKey = false;
+                        await setUserModelConfig(chatId, { geminiKey: key });
+                        if (progressMessage && progressMessage.result) {
+                             await deleteTelegramMessage(chatId, progressMessage.result.message_id);
+                        }
+                        await showGeminiModels(chatId, key);
+                    } else {
+                        if (progressMessage && progressMessage.result) {
+                            await editTelegramMessageText(chatId, progressMessage.result.message_id, "❌ Неверный ключ или нет доступа к моделям. Попробуйте еще раз или введите /cancel", false);
+                        }
+                    }
+                    return;
+                }
+
+                const keyboard = await getUserReplyKeyboard(chatId);
+
+                if (message.text === '/start') {
+                    await updateUserCommandsMenu(chatId);
+                    await sendTelegramMessage(chatId, "👋 Привет! Отправьте мне голосовое сообщение или аудиофайл, и я переведу его в текст.", keyboard);
+                } else if (message.text === '/quota' || message.text === '📊 Проверить квоты') {
+                    await showQuotaInfo(chatId);
+                } else if (message.text === '/change_model' || message.text === '🔄 Сменить модель') {
                     let text = "Выберите из нижеприведенных моделей:\n\n";
                     const inline_keyboard_rows = [];
                     for (const [model_name, description] of Object.entries(MODELS_INFO)) {
@@ -577,37 +907,42 @@ app.post(webhookPath, async (req, res) => {
                         }]);
                     }
                     await sendTelegramMessage(chatId, text, { inline_keyboard: inline_keyboard_rows });
-                } else if (message.text === '/model') {
-                    const currentModel = await getUserModel(chatId);
-                    const modelDescription = MODELS_INFO[currentModel] || "Неизвестная модель";
-                    const text = `Ваша текущая модель:\n*${currentModel}* - ${modelDescription}`;
-                    await sendTelegramMessage(chatId, text);
+                } else if (message.text === '/model' || message.text === 'ℹ️ Моя модель') {
+                    const config = await getUserModelConfig(chatId);
+                    const currentModel = config.model;
+                    let modelDescription = MODELS_INFO[currentModel];
+                    
+                    if (currentModel.startsWith('models/gemini') || currentModel === 'Gemini') {
+                        modelDescription = `✨ Умная (Всего использовано токенов: ${config.geminiUsage || 0})`;
+                    } else if (!modelDescription) {
+                        modelDescription = "Неизвестная модель";
+                    }
+
+                    const text = `Ваша текущая модель:\n*${currentModel.replace('models/', '')}* - ${modelDescription}`;
+                    await sendTelegramMessage(chatId, text, keyboard);
                 } else if (message.text === '/endpoints' && String(chatId) === String(ADMIN_CHAT_ID)) {
                     const text = `vosk: ${VOSK_ENDPOINT}\nwhisper: ${WHISPER_ENDPOINT}`;
                     await sendTelegramMessage(chatId, text);
                 } else {
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
-                    await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
+                    await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (до ${sizeMb} Мб)`, keyboard);
                 }
             } else if (message.voice || message.audio || (message.document && message.document.mime_type.startsWith('audio/'))) {
-                
-
                 const mediaGroupId = message.media_group_id;
                 if (mediaGroupId) {
                     if (processedMediaGroups.has(mediaGroupId)) {
-                        console.log(`[MediaGroup] Игнорируем дубликат из пачки файлов: ID ${mediaGroupId}`);
                         return;
                     }
                     processedMediaGroups.set(mediaGroupId, Date.now());
                 }
 
                 const fileInfo = message.voice || message.audio || message.document;
-                
                 await handleIncomingAudio(chatId, fileInfo, messageId);
 
             } else {
                 const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
-                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (поддерживаются WAV, MP3, OGG) до ${sizeMb} Мб`);
+                const keyboard = await getUserReplyKeyboard(chatId);
+                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (до ${sizeMb} Мб)`, keyboard);
             }
         }
     } catch (error) {
@@ -624,9 +959,6 @@ async function startServer() {
         console.error("FATAL: WEBHOOK_URL is not defined in environment variables. Cannot set webhook.");
         process.exit(1);
     }
-    if (!VOSK_ENDPOINT && !WHISPER_ENDPOINT) {
-        console.warn("WARNING: Neither VOSK_ENDPOINT nor WHISPER_ENDPOINT are defined. ASR functionality will be limited.");
-    }
 
     await ensureDir(TEMP_DIR);
 
@@ -642,7 +974,6 @@ async function startServer() {
         const responseData = await response.json();
         if (response.ok && responseData.ok) {
             console.log(`Webhook set successfully to: ${fullWebhookUrl}`);
-            console.log(`Telegram response: ${responseData.description}`);
         } else {
             console.error('Failed to set Telegram webhook:', responseData);
         }
@@ -652,8 +983,6 @@ async function startServer() {
 
     app.listen(PORT, () => {
         console.log(`Server listening on port ${PORT}`);
-        console.log(`Webhook endpoint available at: ${webhookPath}`);
-
         cleanupTempFiles();
         setInterval(cleanupTempFiles, 60 * 1000);
     });
