@@ -86,7 +86,15 @@ app.use((req, res, next) => {
     const chatId = message?.chat?.id || req.body?.callback_query?.message?.chat?.id;
 
     if (!cmd) {
-        cmd = (message?.voice || message?.audio || (message?.document && message?.document.mime_type.startsWith('audio/'))) ? 'audio' : '';
+        if (message?.video_note) {
+            cmd = 'video_note';
+        } else if (message?.video) {
+            cmd = 'video';
+        } else if (message?.voice || message?.audio || (message?.document && message?.document.mime_type?.startsWith('audio/'))) {
+            cmd = 'audio';
+        } else {
+            cmd = '';
+        }
     } else {
         cmd = `text: '${cmd}'`;
     }
@@ -243,6 +251,7 @@ function convertToWav(inputPath) {
         const outputPath = `${inputPath}.wav`;
         ffmpeg(inputPath)
             .toFormat('wav')
+            .noVideo()
             .audioChannels(1)
             .audioFrequency(16000)
             .outputOptions('-sample_fmt s16')
@@ -927,7 +936,7 @@ app.post(webhookPath, async (req, res) => {
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                     await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (до ${sizeMb} Мб)`, keyboard);
                 }
-            } else if (message.voice || message.audio || (message.document && message.document.mime_type.startsWith('audio/'))) {
+            } else if (message.voice || message.audio || message.video_note (message.document && message.document.mime_type.startsWith('audio/'))) {
                 const mediaGroupId = message.media_group_id;
                 if (mediaGroupId) {
                     if (processedMediaGroups.has(mediaGroupId)) {
@@ -936,13 +945,13 @@ app.post(webhookPath, async (req, res) => {
                     processedMediaGroups.set(mediaGroupId, Date.now());
                 }
 
-                const fileInfo = message.voice || message.audio || message.document;
+                const fileInfo = message.voice || message.audio || message.document || message.video_note;
                 await handleIncomingAudio(chatId, fileInfo, messageId);
 
             } else {
                 const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                 const keyboard = await getUserReplyKeyboard(chatId);
-                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (до ${sizeMb} Мб)`, keyboard);
+                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение, кружочек или аудиофайл (до ${sizeMb} Мб)`, keyboard);
             }
         }
     } catch (error) {
