@@ -256,8 +256,14 @@ function convertToWav(inputPath) {
             .audioFrequency(16000)
             .outputOptions('-sample_fmt s16')
             .on('error', (err) => {
-                console.error('FFmpeg conversion error:', err.message);
-                resolve(false);
+
+                if (err.message.includes('does not contain any stream') || err.message.includes('Output file #0 does not contain any stream')) {
+                    console.warn('В переданном файле отсутствует аудиодорожка.');
+                    resolve('NO_AUDIO_STREAM');
+                } else {
+                    console.error('FFmpeg conversion error:', err.message);
+                    resolve(false);
+                }
             })
             .on('end', () => {
                 resolve(outputPath);
@@ -628,6 +634,10 @@ async function processAudio(fileInfo, chatId, messageToEditId = null) {
         }
 
         wavPath = await convertToWav(localFilePath);
+        
+        if (wavPath === 'NO_AUDIO_STREAM') {
+            return { success: false, error: 'В присланном видеофайле нет звуковой дорожки.' };
+        }
         if (!wavPath) {
             return { success: false, error: 'Ошибка конвертации аудио в формат WAV' };
         }
@@ -870,6 +880,9 @@ app.post(webhookPath, async (req, res) => {
             }
             const state = chatStates.get(chatId);
 
+            const isAudioDoc = message.document && message.document.mime_type?.startsWith('audio/');
+            const isVideoDoc = message.document && message.document.mime_type?.startsWith('video/');
+
             if (message.text) {
                 if (state.awaitingGeminiKey) {
                     const key = message.text.trim();
@@ -936,7 +949,7 @@ app.post(webhookPath, async (req, res) => {
                     const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                     await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение или аудиофайл (до ${sizeMb} Мб)`, keyboard);
                 }
-            } else if (message.voice || message.audio || message.video_note (message.document && message.document.mime_type.startsWith('audio/'))) {
+            } else if (message.video_note || message.video || message.voice || message.audio || isAudioDoc || isVideoDoc) {
                 const mediaGroupId = message.media_group_id;
                 if (mediaGroupId) {
                     if (processedMediaGroups.has(mediaGroupId)) {
@@ -945,13 +958,13 @@ app.post(webhookPath, async (req, res) => {
                     processedMediaGroups.set(mediaGroupId, Date.now());
                 }
 
-                const fileInfo = message.voice || message.audio || message.document || message.video_note;
+                const fileInfo = message.voice || message.audio || message.document || message.video_note || message.video;
                 await handleIncomingAudio(chatId, fileInfo, messageId);
 
             } else {
                 const sizeMb = MAX_FILE_SIZE / (1024 * 1024);
                 const keyboard = await getUserReplyKeyboard(chatId);
-                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение, кружочек или аудиофайл (до ${sizeMb} Мб)`, keyboard);
+                await sendTelegramMessage(chatId, `Пожалуйста, отправьте голосовое сообщение, кружочек, аудио или видеофайл (до ${sizeMb} Мб)`, keyboard);
             }
         }
     } catch (error) {
